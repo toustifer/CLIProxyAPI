@@ -124,7 +124,7 @@ func (e *AntigravityExecutor) buildRequest(ctx context.Context, auth *cliproxyau
 	// shared connection pool by discarding every established TCP + TLS session.
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("Authorization", "Bearer "+token)
-	httpReq.Header.Set("User-Agent", resolveUserAgent(auth))
+	httpReq.Header.Set("User-Agent", e.resolveUserAgent(auth))
 	if host := resolveHost(base); host != "" {
 		httpReq.Host = host
 	}
@@ -411,15 +411,15 @@ func resolveHost(base string) string {
 	return strings.TrimPrefix(strings.TrimPrefix(base, "https://"), "http://")
 }
 
-func resolveUserAgent(auth *cliproxyauth.Auth) string {
-	return misc.AntigravityRequestUserAgent(antigravityConfiguredUserAgent(auth))
+func (e *AntigravityExecutor) resolveUserAgent(auth *cliproxyauth.Auth) string {
+	return misc.AntigravityRequestUserAgent(e.antigravityConfiguredUserAgent(auth))
 }
 
-func resolveLoadCodeAssistUserAgent(auth *cliproxyauth.Auth) string {
-	return misc.AntigravityLoadCodeAssistUserAgent(antigravityConfiguredUserAgent(auth))
+func (e *AntigravityExecutor) resolveLoadCodeAssistUserAgent(auth *cliproxyauth.Auth) string {
+	return misc.AntigravityLoadCodeAssistUserAgent(e.antigravityConfiguredUserAgent(auth))
 }
 
-func antigravityConfiguredUserAgent(auth *cliproxyauth.Auth) string {
+func (e *AntigravityExecutor) antigravityConfiguredUserAgent(auth *cliproxyauth.Auth) string {
 	raw := ""
 	if auth != nil {
 		if auth.Attributes != nil {
@@ -432,6 +432,9 @@ func antigravityConfiguredUserAgent(auth *cliproxyauth.Auth) string {
 				raw = strings.TrimSpace(ua)
 			}
 		}
+	}
+	if raw == "" && e != nil && e.cfg != nil {
+		raw = strings.TrimSpace(e.cfg.Antigravity.UserAgent)
 	}
 	return raw
 }
@@ -456,9 +459,20 @@ func resolveCustomAntigravityBaseURL(auth *cliproxyauth.Auth) string {
 	return ""
 }
 
+func normalizeAntigravityUpstreamModel(modelName string) string {
+	switch modelName {
+	case "gemini-3.8-flash-high", "gemini-3.8-flash":
+		return "gemini-3.8-flash-tiered"
+	case "gemini-3.7-flash-high", "gemini-3.7-flash":
+		return "gemini-3.7-flash-tiered"
+	default:
+		return modelName
+	}
+}
+
 func geminiToAntigravity(modelName string, payload []byte, projectID string, derivedSessionIDs ...string) []byte {
 	template := payload
-	template = helps.SetStringIfDifferent(template, "model", modelName)
+	template = helps.SetStringIfDifferent(template, "model", normalizeAntigravityUpstreamModel(modelName))
 	template = helps.SetStringIfDifferent(template, "userAgent", "antigravity")
 
 	isImageModel := strings.Contains(modelName, "image")

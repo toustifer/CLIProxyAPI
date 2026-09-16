@@ -58,6 +58,15 @@ func (cfg *Config) SanitizeClaudeHeaderDefaults() {
 	cfg.ClaudeHeaderDefaults.Timezone = strings.TrimSpace(cfg.ClaudeHeaderDefaults.Timezone)
 }
 
+// SanitizeAntigravityConfig trims surrounding whitespace from the
+// configured Antigravity provider options.
+func (cfg *Config) SanitizeAntigravityConfig() {
+	if cfg == nil {
+		return
+	}
+	cfg.Antigravity.UserAgent = strings.TrimSpace(cfg.Antigravity.UserAgent)
+}
+
 // SanitizeOAuthModelAlias normalizes and deduplicates global OAuth model name aliases.
 // It trims whitespace, normalizes channel keys to lower-case, drops empty entries,
 // allows multiple aliases per upstream name, and ensures aliases are unique within each channel.

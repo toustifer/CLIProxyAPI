@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
 )
@@ -524,4 +525,114 @@ func assertSchemaSanitizedAndPropertyPreserved(t *testing.T, params map[string]a
 	if _, ok := mode["deprecated"]; ok {
 		t.Fatalf("deprecated should be removed from nested schema")
 	}
+}
+
+func TestNormalizeAntigravityUpstreamModel(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"gemini-3.8-flash-high", "gemini-3.8-flash-tiered"},
+		{"gemini-3.8-flash", "gemini-3.8-flash-tiered"},
+		{"gemini-3.7-flash-high", "gemini-3.7-flash-tiered"},
+		{"gemini-3.7-flash", "gemini-3.7-flash-tiered"},
+		{"gemini-3.8-flash-tiered", "gemini-3.8-flash-tiered"},
+		{"gemini-3.7-flash-tiered", "gemini-3.7-flash-tiered"},
+		{"gemini-3.6-flash-high", "gemini-3.6-flash-high"},
+		{"gemini-2.5-pro", "gemini-2.5-pro"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.input, func(t *testing.T) {
+			got := normalizeAntigravityUpstreamModel(tc.input)
+			if got != tc.want {
+				t.Fatalf("normalizeAntigravityUpstreamModel(%q) = %q, want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAntigravityBuildRequest_NormalizesTieredModelInPayload(t *testing.T) {
+	executor := NewAntigravityExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID: "test-auth",
+		Attributes: map[string]string{
+			"user_agent": "antigravity/1.11.5 windows/amd64",
+		},
+		Metadata: map[string]any{
+			"project_id": "project-1",
+		},
+	}
+	req, err := executor.buildRequest(context.Background(), auth, "token", "gemini-3.8-flash-high", []byte(`{}`), false, "", "")
+	if err != nil {
+		t.Fatalf("buildRequest error = %v", err)
+	}
+
+	body, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		t.Fatalf("read body error = %v", errRead)
+	}
+
+	var parsed map[string]any
+	if errUnmarshal := json.Unmarshal(body, &parsed); errUnmarshal != nil {
+		t.Fatalf("unmarshal error = %v", errUnmarshal)
+	}
+
+	if got, want := parsed["model"], "gemini-3.8-flash-tiered"; got != want {
+		t.Fatalf("payload model = %q, want %q", got, want)
+	}
+}
+
+func TestAntigravityConfiguredUserAgent_Precedence(t *testing.T) {
+	t.Run("auth attributes take highest precedence", func(t *testing.T) {
+		cfg := &config.Config{
+			Antigravity: config.AntigravityConfig{
+				UserAgent: "config-ua",
+			},
+		}
+		e := NewAntigravityExecutor(cfg)
+		auth := &cliproxyauth.Auth{
+			Attributes: map[string]string{"user_agent": "attr-ua"},
+			Metadata:   map[string]any{"user_agent": "meta-ua"},
+		}
+		if got := e.antigravityConfiguredUserAgent(auth); got != "attr-ua" {
+			t.Fatalf("got %q, want %q", got, "attr-ua")
+		}
+	})
+
+	t.Run("auth metadata takes precedence over config", func(t *testing.T) {
+		cfg := &config.Config{
+			Antigravity: config.AntigravityConfig{
+				UserAgent: "config-ua",
+			},
+		}
+		e := NewAntigravityExecutor(cfg)
+		auth := &cliproxyauth.Auth{
+			Metadata: map[string]any{"user_agent": "meta-ua"},
+		}
+		if got := e.antigravityConfiguredUserAgent(auth); got != "meta-ua" {
+			t.Fatalf("got %q, want %q", got, "meta-ua")
+		}
+	})
+
+	t.Run("config user-agent used when auth has none", func(t *testing.T) {
+		cfg := &config.Config{
+			Antigravity: config.AntigravityConfig{
+				UserAgent: "config-ua",
+			},
+		}
+		e := NewAntigravityExecutor(cfg)
+		auth := &cliproxyauth.Auth{}
+		if got := e.antigravityConfiguredUserAgent(auth); got != "config-ua" {
+			t.Fatalf("got %q, want %q", got, "config-ua")
+		}
+	})
+
+	t.Run("empty string when neither auth nor config sets user-agent", func(t *testing.T) {
+		e := NewAntigravityExecutor(&config.Config{})
+		auth := &cliproxyauth.Auth{}
+		if got := e.antigravityConfiguredUserAgent(auth); got != "" {
+			t.Fatalf("got %q, want empty", got)
+		}
+	})
 }

@@ -180,6 +180,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Claude header defaults.
 	cfg.SanitizeClaudeHeaderDefaults()
 
+	// Sanitize Antigravity config.
+	cfg.SanitizeAntigravityConfig()
+
 	// Sanitize Claude key headers
 	cfg.SanitizeClaudeKeys()
 

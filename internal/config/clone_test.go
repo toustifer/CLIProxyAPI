@@ -15,6 +15,19 @@ func TestCloneForRuntimeNil(t *testing.T) {
 	}
 }
 
+func TestParseConfigBytes_AntigravityUserAgent(t *testing.T) {
+	cfg, errParse := ParseConfigBytes([]byte(`antigravity:
+  user-agent: "  antigravity/1.11.5 windows/amd64  "
+`))
+	if errParse != nil {
+		t.Fatalf("ParseConfigBytes() error = %v", errParse)
+	}
+	const want = "antigravity/1.11.5 windows/amd64"
+	if cfg.Antigravity.UserAgent != want {
+		t.Fatalf("Antigravity.UserAgent = %q, want %q", cfg.Antigravity.UserAgent, want)
+	}
+}
+
 func TestParseConfigBytes_AntigravitySensitiveWords(t *testing.T) {
 	cfg, errParse := ParseConfigBytes([]byte(`antigravity:
   sensitive-words:

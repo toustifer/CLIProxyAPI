@@ -149,6 +149,9 @@ type DevinConfig struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
+	// UserAgent optionally overrides the default User-Agent sent on upstream Antigravity requests.
+	UserAgent string `yaml:"user-agent,omitempty" json:"user-agent,omitempty"`
+
 	// SensitiveWords is a list of words to obfuscate with zero-width characters in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 

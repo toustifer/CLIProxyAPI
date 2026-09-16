@@ -174,7 +174,7 @@ func main() {
 		fmt.Println("Fetching Antigravity model list from upstream...")
 
 		fetchCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		models = fetchModels(fetchCtx, chosen)
+		models = fetchModels(fetchCtx, chosen, cfg)
 		cancel()
 
 		if len(models) > 0 {
@@ -216,11 +216,15 @@ func defaultAntigravityFetchBaseURLs() []string {
 	return []string{antigravityBaseURLDaily, antigravityBaseURLProd, antigravitySandboxBaseURLDaily}
 }
 
-func fetchModels(ctx context.Context, auth *coreauth.Auth) []modelEntry {
-	return fetchModelsFromBaseURLs(ctx, auth, defaultAntigravityFetchBaseURLs(), nil)
+func fetchModels(ctx context.Context, auth *coreauth.Auth, cfg *config.Config) []modelEntry {
+	return fetchModelsFromBaseURLs(ctx, auth, defaultAntigravityFetchBaseURLs(), nil, cfg)
 }
 
-func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs []string, client *http.Client) []modelEntry {
+func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs []string, client *http.Client, cfg ...*config.Config) []modelEntry {
+	var cfgObj *config.Config
+	if len(cfg) > 0 {
+		cfgObj = cfg[0]
+	}
 	var accessToken string
 	if auth != nil {
 		accessToken = metaStringValue(auth.Metadata, "access_token")
@@ -251,7 +255,18 @@ func fetchModelsFromBaseURLs(ctx context.Context, auth *coreauth.Auth, baseURLs 
 			httpReq.Close = true
 			httpReq.Header.Set("Content-Type", "application/json")
 			httpReq.Header.Set("Authorization", "Bearer "+accessToken)
-			httpReq.Header.Set("User-Agent", misc.AntigravityUserAgent())
+			ua := misc.AntigravityUserAgent()
+			if auth != nil {
+				if configuredUA := strings.TrimSpace(auth.Attributes["user_agent"]); configuredUA != "" {
+					ua = misc.AntigravityRequestUserAgent(configuredUA)
+				} else if metaUA, ok := auth.Metadata["user_agent"].(string); ok && strings.TrimSpace(metaUA) != "" {
+					ua = misc.AntigravityRequestUserAgent(metaUA)
+				}
+			}
+			if ua == misc.AntigravityUserAgent() && cfgObj != nil && strings.TrimSpace(cfgObj.Antigravity.UserAgent) != "" {
+				ua = misc.AntigravityRequestUserAgent(cfgObj.Antigravity.UserAgent)
+			}
+			httpReq.Header.Set("User-Agent", ua)
 
 			httpClient := client
 			if httpClient == nil {

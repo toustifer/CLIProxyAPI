@@ -372,6 +372,7 @@ codex:
 
 # Antigravity provider behavior.
 # antigravity:
+#   user-agent: "antigravity/1.11.5 windows/amd64" # optional: override default User-Agent for upstream Antigravity requests
 #   sensitive-words:             # optional: words to obfuscate with zero-width characters in system instructions
 #     - "API"
 #     - "proxy"
