@@ -725,9 +725,12 @@ func TestAPICallAppliesAntigravityUserAgent(t *testing.T) {
 	}
 }
 
-// TestAPICallPreservesCallerSuppliedUserAgent keeps the default from clobbering
-// a caller that deliberately sets its own value.
-func TestAPICallPreservesCallerSuppliedUserAgent(t *testing.T) {
+// TestAPICallOverridesCallerAntigravityUserAgent pins the behaviour that actually
+// fixes the dashboard: the panel sends its own hard-coded Antigravity client
+// string, which Google rejects for credentials it wants validated, so the
+// resolved value must win rather than merely filling a gap. This matches the
+// runtime executor, which also always sets its own value for Antigravity.
+func TestAPICallOverridesCallerAntigravityUserAgent(t *testing.T) {
 	t.Parallel()
 
 	var gotUserAgent string
@@ -754,6 +757,60 @@ func TestAPICallPreservesCallerSuppliedUserAgent(t *testing.T) {
 		"method":     "GET",
 		"url":        upstreamServer.URL,
 		"auth_index": auth.EnsureIndex(),
+		"header": map[string]string{
+			// The value the management dashboard actually sends today.
+			"User-Agent": "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)",
+		},
+	}
+	reqBytes, _ := json.Marshal(payload)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(reqBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if gotUserAgent != "antigravity/1.11.5 windows/amd64" {
+		t.Fatalf("upstream User-Agent = %q, want the resolved Antigravity UA to win", gotUserAgent)
+	}
+}
+
+// TestAPICallKeepsNonAntigravityUserAgent makes sure the override stays scoped to
+// Antigravity credentials.
+func TestAPICallKeepsNonAntigravityUserAgent(t *testing.T) {
+	t.Parallel()
+
+	var gotUserAgent string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamServer.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	other := &coreauth.Auth{
+		ID:         "devin-test.json",
+		Provider:   "devin",
+		Attributes: map[string]string{"api_key": "session-token"},
+		Metadata:   map[string]any{"type": "devin", "api_key": "session-token"},
+	}
+	if _, errRegister := manager.Register(context.Background(), other); errRegister != nil {
+		t.Fatalf("register devin auth: %v", errRegister)
+	}
+
+	cfg := &config.Config{}
+	cfg.Antigravity.UserAgent = "antigravity/1.11.5 windows/amd64"
+	h := &Handler{cfg: cfg, authManager: manager}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	payload := map[string]any{
+		"method":     "GET",
+		"url":        upstreamServer.URL,
+		"auth_index": other.EnsureIndex(),
 		"header":     map[string]string{"User-Agent": "caller-supplied/9.9.9"},
 	}
 	reqBytes, _ := json.Marshal(payload)
@@ -767,7 +824,7 @@ func TestAPICallPreservesCallerSuppliedUserAgent(t *testing.T) {
 		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
 	if gotUserAgent != "caller-supplied/9.9.9" {
-		t.Fatalf("upstream User-Agent = %q, want the caller supplied value", gotUserAgent)
+		t.Fatalf("upstream User-Agent = %q, want non-Antigravity callers untouched", gotUserAgent)
 	}
 }
 

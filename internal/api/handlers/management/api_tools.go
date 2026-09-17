@@ -209,13 +209,16 @@ func (h *Handler) APICall(c *gin.Context) {
 		req.Host = hostOverride
 	}
 
-	// Google gates the Antigravity control plane by the client version carried in
-	// User-Agent. Callers such as the management dashboard send only
-	// Authorization, so without this the request leaves as Go's default client
-	// and upstream answers 403 - which surfaces as an unexplained "check the
-	// credential" error while the very same token works from a normal request.
-	if req.Header.Get("User-Agent") == "" && auth != nil &&
-		strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+	// Google gates the Antigravity control plane on the client version carried in
+	// User-Agent, so a stale or unknown version is rejected outright. The
+	// management dashboard sends its own hard-coded Antigravity client string
+	// (antigravity/cli/<version>), which Google refuses for any credential it is
+	// asking to validate - surfacing as an unexplained "check the credential"
+	// error while the very same token works from normal traffic.
+	//
+	// Mirror the executor, which always sets its resolved value and never lets a
+	// caller's Antigravity version win.
+	if auth != nil && strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
 		req.Header.Set("User-Agent", h.antigravityUserAgent(auth))
 	}
 
