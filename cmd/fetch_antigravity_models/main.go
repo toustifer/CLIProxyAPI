@@ -17,12 +17,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,6 +45,11 @@ const (
 	antigravityBaseURLProd         = "https://cloudcode-pa.googleapis.com"
 	antigravityModelsPath          = "/v1internal:fetchAvailableModels"
 	maxFetchAttemptsPerEndpoint    = 2
+
+	// antigravityQuotaRequestTimeout bounds a single fetchAvailableModels call.
+	// Applied per request so one slow base URL cannot consume the budget of the
+	// endpoints tried after it.
+	antigravityQuotaRequestTimeout = 20 * time.Second
 )
 
 func init() {
@@ -73,11 +80,13 @@ func main() {
 	var configPath string
 	var outputPath string
 	var pretty bool
+	var quotaMode bool
 
 	flag.StringVar(&authsDir, "auths-dir", "", "Directory containing auth JSON files (overrides config auth-dir)")
 	flag.StringVar(&configPath, "config", "", "Configure File Path")
 	flag.StringVar(&outputPath, "output", "antigravity_models.json", "Output JSON file path")
 	flag.BoolVar(&pretty, "pretty", true, "Pretty-print the output JSON")
+	flag.BoolVar(&quotaMode, "quota", false, "Report per-account quota for every enabled auth instead of writing the model list")
 	flag.Parse()
 	authsDirOverridden := false
 	flag.Visit(func(f *flag.Flag) {
@@ -165,6 +174,12 @@ func main() {
 	if len(agAuths) == 0 {
 		fmt.Fprintf(os.Stderr, "error: no enabled antigravity auth found in %s\n", authsDir)
 		os.Exit(1)
+	}
+
+	// Quota report is a separate mode: it must inspect every auth, not just the
+	// first one that answers, so it runs before the single-auth model fetch.
+	if quotaMode {
+		os.Exit(reportQuota(ctx, agAuths, cfg))
 	}
 
 	// Fetch models from the upstream Antigravity API using available auths.
@@ -358,4 +373,233 @@ func metaStringValue(m map[string]interface{}, key string) string {
 	default:
 		return ""
 	}
+}
+
+// resolveToolUserAgent applies the same precedence as the runtime executor:
+// auth attributes, then auth metadata, then config, then the dynamic default.
+// Keeping the two in sync matters because Google gates Antigravity by the
+// client version advertised in this header.
+func resolveToolUserAgent(auth *coreauth.Auth, cfg *config.Config) string {
+	var raw string
+	if auth != nil {
+		if ua := strings.TrimSpace(auth.Attributes["user_agent"]); ua != "" {
+			raw = ua
+		} else if ua, ok := auth.Metadata["user_agent"].(string); ok && strings.TrimSpace(ua) != "" {
+			raw = strings.TrimSpace(ua)
+		}
+	}
+	if raw == "" && cfg != nil {
+		raw = strings.TrimSpace(cfg.Antigravity.UserAgent)
+	}
+	if raw == "" {
+		return misc.AntigravityUserAgent()
+	}
+	return misc.AntigravityRequestUserAgent(raw)
+}
+
+// fetchAvailableModelsRaw returns the raw fetchAvailableModels payload for one
+// auth. It deliberately uses the access token already stored in the auth file
+// and never refreshes it: refreshing out of band invalidates the token the
+// running server holds, which shows up there as a 401 until it refreshes again.
+func fetchAvailableModelsRaw(ctx context.Context, auth *coreauth.Auth, cfg *config.Config) ([]byte, error) {
+	if auth == nil {
+		return nil, errors.New("nil auth")
+	}
+	accessToken := metaStringValue(auth.Metadata, "access_token")
+	if accessToken == "" {
+		return nil, errors.New("no access_token in auth metadata")
+	}
+
+	payload := []byte(`{}`)
+	if pid, ok := auth.Metadata["project_id"].(string); ok && strings.TrimSpace(pid) != "" {
+		payload = []byte(fmt.Sprintf(`{"project": %q}`, strings.TrimSpace(pid)))
+	}
+
+	// Per-auth proxy wins, then the global config proxy, then direct. Without
+	// the config fallback this tool cannot reach Google from networks that
+	// require a proxy even though the server itself works fine.
+	proxyRaw := strings.TrimSpace(auth.ProxyURL)
+	if proxyRaw == "" && cfg != nil {
+		proxyRaw = strings.TrimSpace(cfg.ProxyURL)
+	}
+
+	var lastErr error
+	for _, baseURL := range defaultAntigravityFetchBaseURLs() {
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+antigravityModelsPath, strings.NewReader(string(payload)))
+		if errReq != nil {
+			lastErr = errReq
+			continue
+		}
+		httpReq.Close = true
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+accessToken)
+		httpReq.Header.Set("User-Agent", resolveToolUserAgent(auth, cfg))
+
+		// The timeout is per request, not shared across endpoints: one deadline
+		// for the whole loop starves the later base URLs and reports the wrong
+		// endpoint as the failing one.
+		httpClient := &http.Client{Timeout: antigravityQuotaRequestTimeout}
+		if transport, _, errProxy := proxyutil.BuildHTTPTransport(proxyRaw); errProxy == nil && transport != nil {
+			httpClient.Transport = transport
+		}
+
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			lastErr = errDo
+			continue
+		}
+		bodyBytes, errRead := io.ReadAll(httpResp.Body)
+		if errClose := httpResp.Body.Close(); errClose != nil {
+			log.Errorf("response body close error: %v", errClose)
+		}
+		if errRead != nil {
+			lastErr = errRead
+			continue
+		}
+		if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
+			lastErr = fmt.Errorf("upstream status %d: %s", httpResp.StatusCode, truncateForLog(string(bodyBytes), 200))
+			continue
+		}
+		return bodyBytes, nil
+	}
+	if lastErr == nil {
+		lastErr = errors.New("no endpoint returned a response")
+	}
+	return nil, lastErr
+}
+
+func truncateForLog(s string, limit int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "..."
+}
+
+// quotaBucket groups models that share one upstream quota allowance. Antigravity
+// meters quota per model family, so several models often report the identical
+// remaining fraction and reset instant.
+type quotaBucket struct {
+	Remaining float64
+	HasRemain bool
+	ResetRaw  string
+	Models    []string
+}
+
+// reportQuota prints a per-account quota report and returns a process exit code.
+func reportQuota(ctx context.Context, auths []*coreauth.Auth, cfg *config.Config) int {
+	fmt.Printf("Quota report / 额度报告  (%d auths)\n", len(auths))
+	fmt.Println(strings.Repeat("=", 78))
+
+	failures := 0
+	for _, auth := range auths {
+		label := strings.TrimSpace(auth.Label)
+		if label == "" {
+			label = auth.ID
+		}
+		fmt.Printf("\n--- %s ---\n", label)
+
+		// No per-account deadline here: each request inside the helper carries
+		// its own timeout, so a slow endpoint cannot starve the ones after it.
+		raw, errFetch := fetchAvailableModelsRaw(ctx, auth, cfg)
+		if errFetch != nil {
+			failures++
+			fmt.Printf("  FAILED / 获取失败: %s\n", truncateForLog(errFetch.Error(), 220))
+			continue
+		}
+
+		buckets, errParse := parseQuotaBuckets(raw)
+		if errParse != nil {
+			failures++
+			fmt.Printf("  FAILED / 解析失败: %v\n", errParse)
+			continue
+		}
+		if len(buckets) == 0 {
+			fmt.Println("  no quota info returned / 上游未返回额度信息")
+			continue
+		}
+
+		total := 0
+		for _, b := range buckets {
+			total += len(b.Models)
+		}
+		fmt.Printf("  models=%d buckets=%d\n", total, len(buckets))
+		for _, b := range buckets {
+			remaining := "  0.0% (exhausted)"
+			if b.HasRemain {
+				remaining = fmt.Sprintf("%5.1f%%", b.Remaining*100)
+			}
+			reset := b.ResetRaw
+			if reset == "" {
+				reset = "-"
+			} else {
+				reset = formatReset(reset)
+			}
+			fmt.Printf("  [remaining / 剩余 %s]  reset / 重置 %s\n", remaining, reset)
+			fmt.Printf("      %s\n", strings.Join(b.Models, ", "))
+		}
+	}
+
+	fmt.Println()
+	fmt.Println(strings.Repeat("=", 78))
+	fmt.Printf("Done / 完成. accounts=%d failed=%d\n", len(auths), failures)
+	if failures == len(auths) {
+		return 1
+	}
+	return 0
+}
+
+// parseQuotaBuckets groups models by their reported quota allowance.
+func parseQuotaBuckets(raw []byte) ([]quotaBucket, error) {
+	result := gjson.GetBytes(raw, "models")
+	if !result.Exists() {
+		return nil, errors.New(`response has no "models" object`)
+	}
+
+	byKey := map[string]*quotaBucket{}
+	order := []string{}
+	for name, modelData := range result.Map() {
+		modelID := strings.TrimSpace(name)
+		if modelID == "" {
+			continue
+		}
+		quota := modelData.Get("quotaInfo")
+		bucket := &quotaBucket{ResetRaw: quota.Get("resetTime").String()}
+		if frac := quota.Get("remainingFraction"); frac.Exists() {
+			bucket.Remaining = frac.Float()
+			bucket.HasRemain = true
+		}
+		key := fmt.Sprintf("%t|%.6f|%s", bucket.HasRemain, bucket.Remaining, bucket.ResetRaw)
+		existing, ok := byKey[key]
+		if !ok {
+			byKey[key] = bucket
+			existing = bucket
+			order = append(order, key)
+		}
+		existing.Models = append(existing.Models, modelID)
+	}
+
+	buckets := make([]quotaBucket, 0, len(order))
+	for _, key := range order {
+		b := byKey[key]
+		sort.Strings(b.Models)
+		buckets = append(buckets, *b)
+	}
+	// Exhausted buckets first, then most-remaining first: the actionable end.
+	sort.SliceStable(buckets, func(i, j int) bool {
+		if buckets[i].HasRemain != buckets[j].HasRemain {
+			return !buckets[i].HasRemain
+		}
+		return buckets[i].Remaining < buckets[j].Remaining
+	})
+	return buckets, nil
+}
+
+// formatReset renders an RFC3339 reset instant as UTC plus local time.
+func formatReset(raw string) string {
+	parsed, errParse := time.Parse(time.RFC3339, strings.TrimSpace(raw))
+	if errParse != nil {
+		return raw
+	}
+	return fmt.Sprintf("%s (local %s)", parsed.UTC().Format("2006-01-02T15:04:05Z"), parsed.Local().Format("2006-01-02 15:04"))
 }

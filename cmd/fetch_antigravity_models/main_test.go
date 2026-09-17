@@ -5,9 +5,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
@@ -123,5 +125,118 @@ func TestFetchModelsFallbackAfterTwoAttempts(t *testing.T) {
 	}
 	if calls := endpoint2Calls.Load(); calls != 1 {
 		t.Fatalf("expected endpoint 2 to be called 1 time, got %d", calls)
+	}
+}
+
+func TestParseQuotaBucketsGroupsBySharedAllowance(t *testing.T) {
+	raw := []byte(`{
+		"models": {
+			"gemini-3.8-flash-tiered": {"quotaInfo": {"remainingFraction": 0.098, "resetTime": "2026-09-17T22:10:00Z"}},
+			"gemini-3.7-flash-tiered": {"quotaInfo": {"remainingFraction": 0.098, "resetTime": "2026-09-17T22:10:00Z"}},
+			"claude-sonnet-4-6":       {"quotaInfo": {"remainingFraction": 1, "resetTime": "2026-09-17T23:35:31Z"}}
+		}
+	}`)
+
+	buckets, errBuckets := parseQuotaBuckets(raw)
+	if errBuckets != nil {
+		t.Fatalf("parseQuotaBuckets() error = %v", errBuckets)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("expected 2 buckets, got %d: %#v", len(buckets), buckets)
+	}
+	// Buckets sort ascending by remaining fraction, so the scarcer one comes first.
+	first := buckets[0]
+	if !first.HasRemain || first.Remaining > 0.099 {
+		t.Fatalf("expected the 9.8%% bucket first, got %#v", first)
+	}
+	if len(first.Models) != 2 {
+		t.Fatalf("expected the 9.8%% bucket to hold 2 models, got %#v", first.Models)
+	}
+	second := buckets[1]
+	if !second.HasRemain || second.Remaining != 1 || len(second.Models) != 1 {
+		t.Fatalf("expected the 100%% bucket holding 1 model, got %#v", second)
+	}
+}
+
+func TestParseQuotaBucketsPutsExhaustedFirst(t *testing.T) {
+	// An exhausted allowance omits remainingFraction entirely on the wire.
+	raw := []byte(`{
+		"models": {
+			"gemini-3.8-flash-tiered": {"quotaInfo": {"resetTime": "2026-09-17T20:25:07Z"}},
+			"claude-sonnet-4-6":       {"quotaInfo": {"remainingFraction": 1}}
+		}
+	}`)
+
+	buckets, errBuckets := parseQuotaBuckets(raw)
+	if errBuckets != nil {
+		t.Fatalf("parseQuotaBuckets() error = %v", errBuckets)
+	}
+	if len(buckets) != 2 {
+		t.Fatalf("expected 2 buckets, got %d", len(buckets))
+	}
+	if buckets[0].HasRemain {
+		t.Fatalf("expected the exhausted bucket first, got %#v", buckets[0])
+	}
+	if len(buckets[0].Models) != 1 || buckets[0].Models[0] != "gemini-3.8-flash-tiered" {
+		t.Fatalf("exhausted bucket models = %#v", buckets[0].Models)
+	}
+}
+
+func TestParseQuotaBucketsWithoutModelsObject(t *testing.T) {
+	if _, errBuckets := parseQuotaBuckets([]byte(`{"foo": 1}`)); errBuckets == nil {
+		t.Fatal("expected an error when the payload has no models object")
+	}
+}
+
+func TestFormatResetFallsBackToRawValue(t *testing.T) {
+	formatted := formatReset("2026-09-17T22:10:00Z")
+	if !strings.Contains(formatted, "2026-09-17T22:10:00Z") {
+		t.Fatalf("formatReset() = %q, want it to contain the UTC instant", formatted)
+	}
+	if !strings.Contains(formatted, "local ") {
+		t.Fatalf("formatReset() = %q, want it to contain the local rendering", formatted)
+	}
+	if got := formatReset("not-a-timestamp"); got != "not-a-timestamp" {
+		t.Fatalf("formatReset() on unparsable input = %q, want the raw value", got)
+	}
+}
+
+func TestTruncateForLogCollapsesWhitespace(t *testing.T) {
+	if got := truncateForLog("a\n\tb", 10); got != "a b" {
+		t.Fatalf("truncateForLog() = %q, want %q", got, "a b")
+	}
+	long := strings.Repeat("x", 40)
+	got := truncateForLog(long, 10)
+	if got != strings.Repeat("x", 10)+"..." {
+		t.Fatalf("truncateForLog() = %q, want a truncated value", got)
+	}
+}
+
+// TestResolveToolUserAgentPrecedence pins the ordering that makes the config
+// fallback work: auth attributes beat auth metadata beat config. Newly added
+// accounts carry no per-auth UA, so the config value is what keeps them off the
+// dynamic version that Google rejects.
+func TestResolveToolUserAgentPrecedence(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Antigravity.UserAgent = "antigravity/1.11.5 windows/amd64"
+
+	auth := &coreauth.Auth{Metadata: map[string]interface{}{}}
+	if got := resolveToolUserAgent(auth, cfg); got != "antigravity/1.11.5 windows/amd64" {
+		t.Fatalf("config fallback = %q, want the configured UA", got)
+	}
+
+	auth.Metadata["user_agent"] = "antigravity/1.0.0 windows/amd64"
+	if got := resolveToolUserAgent(auth, cfg); got != "antigravity/1.0.0 windows/amd64" {
+		t.Fatalf("metadata override = %q, want the metadata UA", got)
+	}
+
+	auth.Attributes = map[string]string{"user_agent": "antigravity/2.0.0 windows/amd64"}
+	if got := resolveToolUserAgent(auth, cfg); got != "antigravity/2.0.0 windows/amd64" {
+		t.Fatalf("attribute override = %q, want the attribute UA", got)
+	}
+
+	// With nothing configured anywhere the dynamic default is used.
+	if got := resolveToolUserAgent(&coreauth.Auth{Metadata: map[string]interface{}{}}, &config.Config{}); got == "" {
+		t.Fatal("expected a non-empty default UA when nothing is configured")
 	}
 }
