@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
@@ -650,5 +651,152 @@ func TestResolveMetaTokenUsesRequestProxyWithoutSavingOverride(t *testing.T) {
 	live, _ := manager.GetByID(auth.ID)
 	if live.ProxyURL != auth.ProxyURL {
 		t.Fatal("request proxy override changed the credential's configured proxy")
+	}
+}
+
+// antigravityAuthForTest returns an enabled Antigravity credential whose token is
+// far from expiry, so api-call never reaches out to the OAuth token endpoint.
+func antigravityAuthForTest(email string, metadata map[string]any) *coreauth.Auth {
+	if metadata == nil {
+		metadata = map[string]any{}
+	}
+	if _, ok := metadata["access_token"]; !ok {
+		metadata["access_token"] = "test-access-token"
+	}
+	metadata["expired"] = time.Now().Add(time.Hour).Format(time.RFC3339)
+	return &coreauth.Auth{
+		ID:       "antigravity-" + email + ".json",
+		Provider: "antigravity",
+		Label:    email,
+		Metadata: metadata,
+	}
+}
+
+// TestAPICallAppliesAntigravityUserAgent covers the dashboard quota regression:
+// Google gates the Antigravity control plane on the client version in
+// User-Agent, but the dashboard sends only Authorization. Without a default the
+// request goes out as Go's client and upstream answers 403, which the dashboard
+// reports as a credential problem even though the token is perfectly good.
+func TestAPICallAppliesAntigravityUserAgent(t *testing.T) {
+	t.Parallel()
+
+	var gotUserAgent string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"groups":[]}`))
+	}))
+	defer upstreamServer.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	auth := antigravityAuthForTest("quota@example.com", map[string]any{"project_id": "test-project"})
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register antigravity auth: %v", errRegister)
+	}
+
+	cfg := &config.Config{}
+	cfg.Antigravity.UserAgent = "antigravity/1.11.5 windows/amd64"
+	h := &Handler{cfg: cfg, authManager: manager}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	payload := map[string]any{
+		"method":     "POST",
+		"url":        upstreamServer.URL,
+		"auth_index": auth.EnsureIndex(),
+		"header": map[string]string{
+			"Authorization": "Bearer $TOKEN$",
+			"Content-Type":  "application/json",
+		},
+		"data": `{"project":"test-project"}`,
+	}
+	reqBytes, _ := json.Marshal(payload)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(reqBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if gotUserAgent != "antigravity/1.11.5 windows/amd64" {
+		t.Fatalf("upstream User-Agent = %q, want the configured Antigravity UA", gotUserAgent)
+	}
+}
+
+// TestAPICallPreservesCallerSuppliedUserAgent keeps the default from clobbering
+// a caller that deliberately sets its own value.
+func TestAPICallPreservesCallerSuppliedUserAgent(t *testing.T) {
+	t.Parallel()
+
+	var gotUserAgent string
+	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUserAgent = r.Header.Get("User-Agent")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstreamServer.Close()
+
+	manager := coreauth.NewManager(nil, &coreauth.RoundRobinSelector{}, nil)
+	auth := antigravityAuthForTest("explicit@example.com", nil)
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register antigravity auth: %v", errRegister)
+	}
+
+	cfg := &config.Config{}
+	cfg.Antigravity.UserAgent = "antigravity/1.11.5 windows/amd64"
+	h := &Handler{cfg: cfg, authManager: manager}
+	router := gin.New()
+	router.POST("/", h.APICall)
+
+	payload := map[string]any{
+		"method":     "GET",
+		"url":        upstreamServer.URL,
+		"auth_index": auth.EnsureIndex(),
+		"header":     map[string]string{"User-Agent": "caller-supplied/9.9.9"},
+	}
+	reqBytes, _ := json.Marshal(payload)
+
+	recorder := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(reqBytes)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(recorder, req)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d; body = %s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if gotUserAgent != "caller-supplied/9.9.9" {
+		t.Fatalf("upstream User-Agent = %q, want the caller supplied value", gotUserAgent)
+	}
+}
+
+// TestAntigravityUserAgentPrecedence pins the same ordering the runtime executor
+// uses: attribute, then metadata, then config, then the dynamic default.
+func TestAntigravityUserAgentPrecedence(t *testing.T) {
+	t.Parallel()
+
+	cfg := &config.Config{}
+	cfg.Antigravity.UserAgent = "antigravity/1.11.5 windows/amd64"
+	h := &Handler{cfg: cfg}
+
+	auth := antigravityAuthForTest("precedence@example.com", nil)
+	if got := h.antigravityUserAgent(auth); got != "antigravity/1.11.5 windows/amd64" {
+		t.Fatalf("config fallback = %q, want the configured UA", got)
+	}
+
+	auth.Metadata["user_agent"] = "antigravity/1.0.0 windows/amd64"
+	if got := h.antigravityUserAgent(auth); got != "antigravity/1.0.0 windows/amd64" {
+		t.Fatalf("metadata override = %q, want the metadata UA", got)
+	}
+
+	auth.Attributes = map[string]string{"user_agent": "antigravity/2.0.0 windows/amd64"}
+	if got := h.antigravityUserAgent(auth); got != "antigravity/2.0.0 windows/amd64" {
+		t.Fatalf("attribute override = %q, want the attribute UA", got)
+	}
+
+	// With nothing configured the dynamically resolved default is used.
+	if got := (&Handler{cfg: &config.Config{}}).antigravityUserAgent(antigravityAuthForTest("default@example.com", nil)); got == "" {
+		t.Fatal("expected a non-empty default UA when nothing is configured")
 	}
 }

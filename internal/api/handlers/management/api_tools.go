@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/proxyutil"
@@ -208,6 +209,16 @@ func (h *Handler) APICall(c *gin.Context) {
 		req.Host = hostOverride
 	}
 
+	// Google gates the Antigravity control plane by the client version carried in
+	// User-Agent. Callers such as the management dashboard send only
+	// Authorization, so without this the request leaves as Go's default client
+	// and upstream answers 403 - which surfaces as an unexplained "check the
+	// credential" error while the very same token works from a normal request.
+	if req.Header.Get("User-Agent") == "" && auth != nil &&
+		strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+		req.Header.Set("User-Agent", h.antigravityUserAgent(auth))
+	}
+
 	httpClient := &http.Client{
 		Timeout: defaultAPICallTimeout,
 	}
@@ -266,6 +277,29 @@ func tokenValueForAuth(auth *coreauth.Auth) string {
 		}
 	}
 	return ""
+}
+
+// antigravityUserAgent mirrors the runtime executor precedence: per-auth
+// attribute, then per-auth metadata, then the configured provider value, then
+// the dynamically resolved default. Keeping the two in step matters because
+// Google rejects the control plane outright when the advertised version is one
+// it expects to have completed account validation.
+func (h *Handler) antigravityUserAgent(auth *coreauth.Auth) string {
+	var raw string
+	if auth != nil {
+		if ua := strings.TrimSpace(auth.Attributes["user_agent"]); ua != "" {
+			raw = ua
+		} else if ua, ok := auth.Metadata["user_agent"].(string); ok && strings.TrimSpace(ua) != "" {
+			raw = strings.TrimSpace(ua)
+		}
+	}
+	if raw == "" && h != nil && h.cfg != nil {
+		raw = strings.TrimSpace(h.cfg.Antigravity.UserAgent)
+	}
+	if raw == "" {
+		return misc.AntigravityUserAgent()
+	}
+	return misc.AntigravityRequestUserAgent(raw)
 }
 
 func (h *Handler) resolveTokenForAuth(ctx context.Context, auth *coreauth.Auth, requestProxyURL string) (string, error) {
